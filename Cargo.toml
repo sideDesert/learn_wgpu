@@ -1,0 +1,11 @@
+[package]
+name = "learn_wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "*"
+env_logger = "*"
+log = "*"
+wgpu = "*"
+futures = "*"
