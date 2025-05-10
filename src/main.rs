@@ -1,12 +1,15 @@
 mod renderer_backend;
 
 use futures::executor::block_on;
-use renderer_backend::pipeline_builder::PipelineBuilder;
+use renderer_backend::material::Material;
+use renderer_backend::pipeline::RenderPipelineBuilder;
+use renderer_backend::{bind_group_layout, mesh_builder};
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 
 use wgpu::{
-    Adapter, RenderPipeline, RequestAdapterOptions, RequestAdapterOptionsBase, SurfaceTarget,
+    Adapter, ComputePipeline, RenderPipeline, RequestAdapterOptions, RequestAdapterOptionsBase,
+    SurfaceTarget,
 };
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -25,6 +28,11 @@ struct App<'a> {
     config: Option<SurfaceConfiguration>,
     size: (u32, u32),
     render_pipeline: Option<RenderPipeline>,
+    compute_pipeline: Option<ComputePipeline>,
+    triangle_mesh: Option<wgpu::Buffer>,
+    quad_mesh: Option<mesh_builder::Mesh>,
+    triangle_material: Option<Material>,
+    quad_material: Option<Material>,
 }
 
 enum CustomEvent {
@@ -46,6 +54,14 @@ impl<'a> App<'a> {
         self.instance.as_ref().unwrap()
     }
 
+    fn get_quad_material(&self) -> &Material {
+        self.quad_material.as_ref().unwrap()
+    }
+
+    fn get_triangle_material(&self) -> &Material {
+        self.triangle_material.as_ref().unwrap()
+    }
+
     fn get_device(&self) -> &Device {
         self.device.as_ref().unwrap()
     }
@@ -62,6 +78,22 @@ impl<'a> App<'a> {
         self.config.as_mut().unwrap()
     }
 
+    #[allow(dead_code)]
+    fn get_compute_pipeline(&self) -> &wgpu::ComputePipeline {
+        self.compute_pipeline.as_ref().unwrap()
+    }
+
+    fn get_triangle_mesh(&self) -> &wgpu::Buffer {
+        self.triangle_mesh.as_ref().unwrap()
+    }
+
+    fn get_quad_mesh(&self) -> &mesh_builder::Mesh {
+        self.quad_mesh.as_ref().unwrap()
+    }
+
+    fn get_render_pipeline(&self) -> &wgpu::RenderPipeline {
+        self.render_pipeline.as_ref().unwrap()
+    }
     async fn handle_adapter(
         &self,
         adapter_descriptor: &RequestAdapterOptions<'a, 'a>,
@@ -125,7 +157,7 @@ impl<'a> App<'a> {
             .next()
             .unwrap_or(surface_capabilities.formats[0]);
 
-        let config = wgpu::SurfaceConfiguration {
+        let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
@@ -136,21 +168,64 @@ impl<'a> App<'a> {
             desired_maximum_frame_latency: 2,
         };
 
-        let mut pipeline_builder = PipelineBuilder::new();
-        pipeline_builder.set_shader_module("shaders/shader.wgsl", "vs_main", "fs_main");
-        pipeline_builder.set_pixel_format(config.format);
-        let render_pipeline = pipeline_builder.build(&device);
+        // CREATE THE MESH
+        let triangle_mesh = mesh_builder::make_triangle(&device);
+        let quad_mesh = mesh_builder::make_quad(&device);
 
-        self.surface.as_ref().unwrap().configure(&device, &config);
+        let material_bind_group_layout: wgpu::BindGroupLayout;
+        {
+            let mut builder = bind_group_layout::Builder::new(&device);
+            builder.add_material();
+            material_bind_group_layout = builder.build("Material Bind Group Layout");
+        }
 
+        let render_pipeline: wgpu::RenderPipeline;
+        {
+            let mut builder = RenderPipelineBuilder::new(&device);
+            builder.set_shader_module("shaders/shader.wgsl", "vs_main", "fs_main");
+            builder.set_pixel_format(surface_configuration.format);
+            builder.add_vertex_buffer_layout(mesh_builder::Vertex::get_layout());
+            builder.add_bind_group_layout(&material_bind_group_layout);
+            render_pipeline = builder.build("Render Pipeline");
+        }
+
+        let quad_material = Material::new(
+            "img/satin.jpg",
+            &device,
+            &queue,
+            "Quad Material",
+            &material_bind_group_layout,
+        );
+
+        let triangle_material = Material::new(
+            "img/rezero.jpg",
+            &device,
+            &queue,
+            "Triangle Material",
+            &material_bind_group_layout,
+        );
+        // let mut compute_pipeline_builder = ComputePipelineBuilder::new();
+        // compute_pipeline_builder.set_shader_module("shaders/shader.wgsl", "computeSomething");
+        // let compute_pipeline = compute_pipeline_builder.build(&device);
+
+        self.surface
+            .as_ref()
+            .unwrap()
+            .configure(&device, &surface_configuration);
         self.device = Some(device);
         self.queue = Some(queue);
-        self.config = Some(config);
+        self.config = Some(surface_configuration);
         self.size = (size.width, size.height);
         self.render_pipeline = Some(render_pipeline);
+        // self.compute_pipeline = Some(compute_pipeline);
+        self.triangle_mesh = Some(triangle_mesh);
+        self.quad_mesh = Some(quad_mesh);
+        self.quad_material = Some(quad_material);
+        self.triangle_material = Some(triangle_material)
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        println!("Rerendering...");
         let drawable = self.get_surface().get_current_texture()?;
         let image_view_descc = wgpu::TextureViewDescriptor::default();
         let image_view = drawable.texture.create_view(&image_view_descc);
@@ -168,14 +243,15 @@ impl<'a> App<'a> {
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.25,
-                    g: 0.0,
-                    b: 0.5,
+                    r: 0.98,
+                    g: 0.93,
+                    b: 0.80,
                     a: 0.0,
                 }),
                 store: wgpu::StoreOp::Store,
             },
         };
+
         let render_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("Renderpass"),
             color_attachments: &[Some(color_attachment)],
@@ -184,12 +260,29 @@ impl<'a> App<'a> {
 
         {
             let mut renderpass = command_encoder.begin_render_pass(&render_pass_descriptor);
-            renderpass.set_pipeline(&self.render_pipeline.as_ref().unwrap());
+            renderpass.set_pipeline(&self.get_render_pipeline());
+
+            // Render Quad
+            renderpass.set_bind_group(0, &self.get_quad_material().bind_group, &[]);
+            let quad_mesh = self.get_quad_mesh();
+            let offset = quad_mesh.offset;
+            let vertex_buffer = quad_mesh.buffer.slice(..offset);
+            let index_buffer = quad_mesh.buffer.slice(offset..);
+
+            renderpass.set_vertex_buffer(0, vertex_buffer);
+            renderpass.set_index_buffer(index_buffer, wgpu::IndexFormat::Uint16);
+            renderpass.draw_indexed(0..6, 0, 0..1);
+
+            // Render Triangle
+            renderpass.set_bind_group(0, &self.get_triangle_material().bind_group, &[]);
+            renderpass.set_vertex_buffer(0, self.get_triangle_mesh().slice(..));
             renderpass.draw(0..3, 0..1);
         }
 
-        self.get_queue()
-            .submit(std::iter::once(command_encoder.finish()));
+        let command_buffer1 = command_encoder.finish();
+        // let command_buffer2 = doubling_encoder.finish();
+
+        self.get_queue().submit([command_buffer1]);
 
         drawable.present();
         Ok(())
@@ -197,10 +290,16 @@ impl<'a> App<'a> {
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = (new_size.width, new_size.height);
+            let limits = self.get_device().limits();
+            let max_texture_dimension = limits.max_texture_dimension_2d.min(8192);
+
+            let clamped_width = new_size.width.min(max_texture_dimension);
+            let clamped_height = new_size.height.min(max_texture_dimension);
+            self.size = (clamped_width, clamped_height);
+            // self.size = (new_size.width, new_size.height);
             let config = self.get_config_mut();
-            config.width = new_size.width as u32;
-            config.height = new_size.height as u32;
+            config.width = clamped_width;
+            config.height = clamped_height;
 
             self.get_surface()
                 .configure(self.get_device(), self.get_config());
@@ -277,12 +376,12 @@ fn main() {
     let event_loop = EventLoop::<CustomEvent>::with_user_event().build().unwrap();
     let mut state = App::new();
 
-    let event_loop_proxy = event_loop.create_proxy();
+    // let event_loop_proxy = event_loop.create_proxy();
 
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(17));
-        event_loop_proxy.send_event(CustomEvent::Timer).ok();
-    });
+    // std::thread::spawn(move || loop {
+    //     std::thread::sleep(std::time::Duration::from_millis(17));
+    //     event_loop_proxy.send_event(CustomEvent::Timer).ok();
+    // });
 
     let _ = event_loop.run_app(&mut state);
 }
